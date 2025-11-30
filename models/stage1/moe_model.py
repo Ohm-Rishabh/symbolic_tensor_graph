@@ -6,6 +6,7 @@ from symbolic_tensor_graph.graph.replicate_graph import ReplicateGraph
 from symbolic_tensor_graph.graph.graph import TensorGraph
 from symbolic_tensor_graph.graph.grad_updater import FSDPWeightGradManager
 from symbolic_tensor_graph.ops import Add, PlaceHolder
+from symbolic_tensor_graph.tensor import Tensor
 from .llama_model import group_query_attention, transformer_decoders
 from .utils import reduce_chain
 
@@ -130,100 +131,174 @@ def feed_forward_network(
 
 
 def transformer_decoder_block(
-    symbol_map_value, layernorm_path=None, residual_path=None
+    symbol_map_value, layernorm_path=None, residual_path=None, mode="default"
 ):
+    """
+    mode: "default" (both attention and FFN), "attention" (only attention), "ffn" (only FFN)
+    """
     if layernorm_path is None:
         layernorm_path = "./sharding_spreadsheets/module3/tpsp_moe/layer_norm.csv"
     if residual_path is None:
         residual_path = "./sharding_spreadsheets/module3/tpsp_moe/residual.csv"
 
-    input_layernorm = ReplicateGraph.apply(
-        TensorGraph.load_tensor_graph(layernorm_path),
-        "input_norm.%s",
-        old_symbol_map_new_symbol={"tp": "tp"},
-    )
-    mha = ReplicateGraph.apply(
-        group_query_attention(), "mha.%s", old_symbol_map_new_symbol={"tp": "tp"}
-    )
-    mha_res = ReplicateGraph.apply(
-        TensorGraph.load_tensor_graph(residual_path),
-        "mha_res.%s",
-        old_symbol_map_new_symbol={"tp": "tp"},
-    )
-
-    post_layernorm = ReplicateGraph.apply(
-        TensorGraph.load_tensor_graph(layernorm_path),
-        "post_attn_norm.%s",
-        old_symbol_map_new_symbol={"tp": "tp"},
-    )
-
-    ffn = feed_forward_network(symbol_map_value)
-
-    ffn_res = ReplicateGraph.apply(
-        TensorGraph.load_tensor_graph(residual_path),
-        "ffn_res.%s",
-        old_symbol_map_new_symbol={"tp": "tp"},
-    )
-
+    components = []
     links = dict()
-    # input_layernorm
-    links["input_norm.y"] = "mha.x"
-    # links["mha_dx"] = "input_norm_dy"
 
-    # mha
-    links["mha.o"] = "mha_res.x1"
-    links["input_norm.x"] = "mha_res.x2"
-    links["mha_res.dx1"] = "mha.do"
-    # links["mha_res_dx2"] = "input_norm_dy"
+    # Build attention components if mode is "default" or "attention"
+    if mode in ["default", "attention"]:
+        input_layernorm = ReplicateGraph.apply(
+            TensorGraph.load_tensor_graph(layernorm_path),
+            "input_norm.%s",
+            old_symbol_map_new_symbol={"tp": "tp"},
+        )
+        mha = ReplicateGraph.apply(
+            group_query_attention(), "mha.%s", old_symbol_map_new_symbol={"tp": "tp"}
+        )
+        mha_res = ReplicateGraph.apply(
+            TensorGraph.load_tensor_graph(residual_path),
+            "mha_res.%s",
+            old_symbol_map_new_symbol={"tp": "tp"},
+        )
+        components.extend([input_layernorm, mha, mha_res])
 
-    # mha res
-    links["mha_res.y"] = "post_attn_norm.x"
-    links["post_attn_norm.dx"] = "mha_res.dy"
+        # input_layernorm
+        links["input_norm.y"] = "mha.x"
+        # mha
+        links["mha.o"] = "mha_res.x1"
+        links["input_norm.x"] = "mha_res.x2"
+        links["mha_res.dx1"] = "mha.do"
 
-    # post_layer_norm
-    links["post_attn_norm.y"] = "moe.x"
-    # links["moe_dx"] = "post_layer_norm_dy"
+    # For attention-only mode, add a pass-through ffn_res so transformer_decoders can connect blocks
+    if mode == "attention":
+        ffn_res = ReplicateGraph.apply(
+            TensorGraph.load_tensor_graph(residual_path),
+            "ffn_res.%s",
+            old_symbol_map_new_symbol={"tp": "tp"},
+        )
+        components.append(ffn_res)
+        # Connect mha_res.y to ffn_res (pass-through: ffn_res.y = mha_res.y + input_norm.x)
+        # Residual does y = x1 + x2, so we connect mha_res.y to x1 and input_norm.x to x2
+        # Note: ffn_res.dx2 will be handled in gradient section, not via links
+        links["mha_res.y"] = "ffn_res.x1"
+        links["input_norm.x"] = "ffn_res.x2"
+        links["ffn_res.dx1"] = "mha_res.dy"
 
-    # ffn
-    links["moe.y"] = "ffn_res.x1"
-    links["post_attn_norm.x"] = "ffn_res.x2"
-    links["ffn_res.dx1"] = "moe.dy"
-    # links["ffn_res_dx2"] = "post_layer_norm_dy"
+    # Build FFN components if mode is "default" or "ffn"
+    if mode in ["default", "ffn"]:
+        if mode == "ffn":
+            # For FFN-only mode, create input_norm as a pass-through to post_attn_norm
+            # This allows transformer_decoders to connect blocks using input_norm.x
+            input_layernorm = ReplicateGraph.apply(
+                TensorGraph.load_tensor_graph(layernorm_path),
+                "input_norm.%s",
+                old_symbol_map_new_symbol={"tp": "tp"},
+            )
+            post_layernorm = ReplicateGraph.apply(
+                TensorGraph.load_tensor_graph(layernorm_path),
+                "post_attn_norm.%s",
+                old_symbol_map_new_symbol={"tp": "tp"},
+            )
+            components.extend([input_layernorm, post_layernorm])
+            # Connect input_norm directly to post_attn_norm (pass-through)
+            links["input_norm.y"] = "post_attn_norm.x"
+            links["post_attn_norm.dx"] = "input_norm.dy"
+        elif mode == "default":
+            # For default mode, connect attention to FFN
+            post_layernorm = ReplicateGraph.apply(
+                TensorGraph.load_tensor_graph(layernorm_path),
+                "post_attn_norm.%s",
+                old_symbol_map_new_symbol={"tp": "tp"},
+            )
+            components.append(post_layernorm)
+            # mha res
+            links["mha_res.y"] = "post_attn_norm.x"
+            links["post_attn_norm.dx"] = "mha_res.dy"
 
-    decoder_block = ConnectGraph.apply(
-        [input_layernorm, mha, mha_res, post_layernorm, ffn, ffn_res], links
-    )
+        ffn = feed_forward_network(symbol_map_value)
+        ffn_res = ReplicateGraph.apply(
+            TensorGraph.load_tensor_graph(residual_path),
+            "ffn_res.%s",
+            old_symbol_map_new_symbol={"tp": "tp"},
+        )
+        components.extend([ffn, ffn_res])
+
+        # post_layer_norm
+        links["post_attn_norm.y"] = "moe.x"
+        # ffn
+        links["moe.y"] = "ffn_res.x1"
+        links["post_attn_norm.x"] = "ffn_res.x2"
+        links["ffn_res.dx1"] = "moe.dy"
+
+    decoder_block = ConnectGraph.apply(components, links)
 
     tensor_id_map_tensor = decoder_block.get_tensor_id_map_tensor()
 
-    input_norm_dy = tensor_id_map_tensor["input_norm.dy@0"]
-    assert input_norm_dy.op_type == PlaceHolder.type_name
-    input_norm_dy.op_type = Add.type_name
-    input_norm_dy.x1 = tensor_id_map_tensor["mha.dx@0"]
-    input_norm_dy.x2 = tensor_id_map_tensor["mha_res.dx2@0"]
-    input_norm_dy.x2_shape = copy.deepcopy(input_norm_dy.x1_shape)
-    input_norm_dy.x2_hidden = copy.deepcopy(input_norm_dy.x1_hidden)
-    decoder_block.in_tensors.remove(input_norm_dy)
-    decoder_block.out_tensors.remove(input_norm_dy.x1)
-    decoder_block.out_tensors.remove(input_norm_dy.x2)
+    # Handle gradient connections based on mode
+    if mode in ["default", "attention"]:
+        input_norm_dy = tensor_id_map_tensor["input_norm.dy@0"]
+        assert input_norm_dy.op_type == PlaceHolder.type_name
+        input_norm_dy.op_type = Add.type_name
+        input_norm_dy.x1 = tensor_id_map_tensor["mha.dx@0"]
+        if mode == "attention":
+            # In attention mode, input_norm.dy also gets gradient from ffn_res.dx2
+            # Create a chain: first add mha_res.dx2 and ffn_res.dx2, then add mha.dx
+            ffn_res_dx2 = tensor_id_map_tensor.get("ffn_res.dx2@0")
+            if ffn_res_dx2:
+                # Create intermediate Add: mha_res.dx2 + ffn_res.dx2
+                temp_add = Tensor(create_empty=True)
+                temp_add.name = "input_norm.dy_temp"
+                temp_add.op_type = Add.type_name
+                temp_add.x1 = tensor_id_map_tensor["mha_res.dx2@0"]
+                temp_add.x2 = ffn_res_dx2
+                temp_add.x1_shape = copy.deepcopy(input_norm_dy.x1_shape)
+                temp_add.x1_hidden = copy.deepcopy(input_norm_dy.x1_hidden)
+                temp_add.x2_shape = copy.deepcopy(input_norm_dy.x1_shape)
+                temp_add.x2_hidden = copy.deepcopy(input_norm_dy.x1_hidden)
+                decoder_block.tensors.append(temp_add)
+                input_norm_dy.x2 = temp_add
+                decoder_block.out_tensors.remove(ffn_res_dx2)
+            else:
+                input_norm_dy.x2 = tensor_id_map_tensor["mha_res.dx2@0"]
+        else:
+            input_norm_dy.x2 = tensor_id_map_tensor["mha_res.dx2@0"]
+        input_norm_dy.x2_shape = copy.deepcopy(input_norm_dy.x1_shape)
+        input_norm_dy.x2_hidden = copy.deepcopy(input_norm_dy.x1_hidden)
+        decoder_block.in_tensors.remove(input_norm_dy)
+        decoder_block.out_tensors.remove(input_norm_dy.x1)
+        # Only remove x2 from out_tensors if it's actually in the list
+        # In attention mode, x2 might be temp_add which is not in out_tensors
+        if input_norm_dy.x2 in decoder_block.out_tensors:
+            decoder_block.out_tensors.remove(input_norm_dy.x2)
+    elif mode == "ffn":
+        # In FFN-only mode, input_norm is just a pass-through, so dy comes from post_attn_norm
+        # The gradient is already connected via links["post_attn_norm.dx"] = "input_norm.dy"
+        # After ConnectGraph.apply, input_norm.dy might not be a PlaceHolder anymore
+        # We just need to make sure it's not in in_tensors if it exists
+        input_norm_dy = tensor_id_map_tensor.get("input_norm.dy@0")
+        if input_norm_dy and input_norm_dy in decoder_block.in_tensors:
+            decoder_block.in_tensors.remove(input_norm_dy)
 
-    post_attn_norm_dy = tensor_id_map_tensor["post_attn_norm.dy@0"]
-    assert post_attn_norm_dy.op_type == PlaceHolder.type_name
-    post_attn_norm_dy.op_type = Add.type_name
-    post_attn_norm_dy.x1 = tensor_id_map_tensor["moe.dx@0"]
-    post_attn_norm_dy.x2 = tensor_id_map_tensor["ffn_res.dx2@0"]
-    post_attn_norm_dy.x2_shape = copy.deepcopy(post_attn_norm_dy.x1_shape)
-    post_attn_norm_dy.x2_hidden = copy.deepcopy(post_attn_norm_dy.x1_hidden)
-    decoder_block.in_tensors.remove(post_attn_norm_dy)
-    decoder_block.out_tensors.remove(post_attn_norm_dy.x1)
-    decoder_block.out_tensors.remove(post_attn_norm_dy.x2)
+    if mode in ["default", "ffn"]:
+        post_attn_norm_dy = tensor_id_map_tensor["post_attn_norm.dy@0"]
+        assert post_attn_norm_dy.op_type == PlaceHolder.type_name
+        post_attn_norm_dy.op_type = Add.type_name
+        post_attn_norm_dy.x1 = tensor_id_map_tensor["moe.dx@0"]
+        post_attn_norm_dy.x2 = tensor_id_map_tensor["ffn_res.dx2@0"]
+        post_attn_norm_dy.x2_shape = copy.deepcopy(post_attn_norm_dy.x1_shape)
+        post_attn_norm_dy.x2_hidden = copy.deepcopy(post_attn_norm_dy.x1_hidden)
+        decoder_block.in_tensors.remove(post_attn_norm_dy)
+        decoder_block.out_tensors.remove(post_attn_norm_dy.x1)
+        decoder_block.out_tensors.remove(post_attn_norm_dy.x2)
 
     decoder_block = FSDPWeightGradManager.apply(decoder_block)
 
     return decoder_block
 
 
-def transformer(num_layers, symbol_map_value, embedding_path=None, regenerate=False):
+def transformer(num_layers, symbol_map_value, embedding_path=None, regenerate=False, mode="default"):
+    """
+    mode: "default" (both attention and FFN), "attention" (only attention), "ffn" (only FFN)
+    """
     from . import CACHE_DIR
     import os
 
@@ -233,7 +308,7 @@ def transformer(num_layers, symbol_map_value, embedding_path=None, regenerate=Fa
     ep = symbol_map_value[ep]
     experts_each_group = experts / ep
     cache_filename = os.path.join(
-        CACHE_DIR, f"moe_{num_layers}_{experts_each_group}.csv"
+        CACHE_DIR, f"moe_{mode}_{num_layers}_{experts_each_group}.csv"
     )
     if os.path.exists(cache_filename) and not regenerate:
         return TensorGraph.load_tensor_graph(cache_filename)
@@ -251,14 +326,22 @@ def transformer(num_layers, symbol_map_value, embedding_path=None, regenerate=Fa
         old_symbol_map_new_symbol={"Din": "Dmodel", "Dout": "Dvocal", "tp": "tp"},
     )
 
-    decoder_template = transformer_decoder_block(symbol_map_value)
+    decoder_template = transformer_decoder_block(symbol_map_value, mode=mode)
     decoders = transformer_decoders(num_layers, decoder_template)
 
     links = dict()
+    # Connect input embedding - all modes now have input_norm
     links["in_emb.y"] = "transformer.0.input_norm.x"
     links["transformer.0.input_norm.dx"] = "in_emb.dy"
-    links[f"transformer.{num_layers-1}.ffn_res.y"] = "out_emb.x"
-    links["out_emb.dx"] = f"transformer.{num_layers-1}.ffn_res.dy"
+
+    # Connect output embedding based on mode
+    if mode in ["default", "ffn"]:
+        links[f"transformer.{num_layers-1}.ffn_res.y"] = "out_emb.x"
+        links["out_emb.dx"] = f"transformer.{num_layers-1}.ffn_res.dy"
+    elif mode == "attention":
+        # In attention mode, mha_res.y is connected to ffn_res.x1, so output is ffn_res.y
+        links[f"transformer.{num_layers-1}.ffn_res.y"] = "out_emb.x"
+        links["out_emb.dx"] = f"transformer.{num_layers-1}.ffn_res.dy"
 
     transformer = ConnectGraph.apply([decoders, in_emb, out_emb], links)
 

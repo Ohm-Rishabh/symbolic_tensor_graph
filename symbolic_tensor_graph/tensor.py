@@ -76,8 +76,12 @@ class Tensor:
     @staticmethod
     def parse_expr(expr):
         if not OPTIMIZE:
+            # Fix: Replace Micro(MicroBatch) with MicroBatch before parsing
+            expr = str(expr).replace("Micro(MicroBatch)", "MicroBatch")
             return sp.parse_expr(expr)
         expr = expr.strip()
+        # Fix: Replace Micro(MicroBatch) with MicroBatch before parsing
+        expr = expr.replace("Micro(MicroBatch)", "MicroBatch")
         if not expr in Tensor._parsed_expr_cache:
             Tensor._parsed_expr_cache[expr] = sp.parse_expr(expr)
         return copy.deepcopy(Tensor._parsed_expr_cache[expr])
@@ -95,6 +99,12 @@ class Tensor:
         if isinstance(expr, int) or isinstance(expr, float):
             # already value
             return expr
+        # Fix: Replace Micro(MicroBatch) with MicroBatch in already-parsed expressions
+        # Convert to string, replace, and re-parse if needed
+        expr_str = str(expr)
+        if "Micro(MicroBatch)" in expr_str:
+            expr_str = expr_str.replace("Micro(MicroBatch)", "MicroBatch")
+            expr = sp.parse_expr(expr_str)
         if not OPTIMIZE:
             return float(expr.evalf(subs=target_symbol_value_dict))
         target_eval_expr_cache = None

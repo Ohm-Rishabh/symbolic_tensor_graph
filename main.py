@@ -418,7 +418,7 @@ def main():
 
         assert args.tpsp
         print("Assembling moe model")
-        transformer_moe = transformer_moe(num_stacks, symbol_map_value, regenerate=True)
+        transformer_moe = transformer_moe(num_stacks, symbol_map_value, regenerate=True, mode="default")
         if os.environ.get("STAGE_MICROBATCH_OPTIMIZE", "0") == "0":
             transformer_moe = MicroBatchReplicator.apply(
                 transformer_moe, symbol_map_value
@@ -487,6 +487,174 @@ def main():
         )
 
         print("MoE model: reading out")
+        if os.environ.get("STAGE_MICROBATCH_OPTIMIZE", "0") != "0":
+            distributed_chakra_graph_moe = MicroBatchReplicatorPostProcess.apply(
+                distributed_chakra_graph_moe, args.batch // args.micro_batch
+            )
+        distributed_chakra_graph_moe.readout(generated_filename, backend=ReadoutBackend)
+
+    elif args.model_type == "moe_attention":
+        from models.stage1.moe_model import transformer as transformer_moe
+
+        assert args.tpsp
+        print("Assembling MoE attention-only model")
+        # For attention-only mode, set MoE-related symbols to safe values to avoid issues
+        # with expressions that might reference them, even though we don't use experts
+        # Keep these values throughout the entire attention-only processing
+        original_ep = symbol_map_value[ep]
+        original_experts = symbol_map_value[Experts]
+        original_kexperts = symbol_map_value[KExperts]
+        symbol_map_value[ep] = 1
+        symbol_map_value[Experts] = 1
+        symbol_map_value[KExperts] = 1
+        transformer_moe = transformer_moe(num_stacks, symbol_map_value, regenerate=True, mode="attention")
+        if os.environ.get("STAGE_MICROBATCH_OPTIMIZE", "0") == "0":
+            transformer_moe = MicroBatchReplicator.apply(
+                transformer_moe, symbol_map_value
+            )
+        else:
+            print("[Warning] MICROBATCH OPTIMIZE sometimes generate incorrect graphs, use with caution!")
+            assert False, "disable for now"
+        transformer_moe = ReplicateGraph.apply(
+            transformer_moe,
+            inplace=True,
+            old_symbol_map_new_symbol={"Batch": "MicroBatch"},
+        )
+
+        if args.weight_sharded:
+            transformer_moe = ReplicateGraph.apply(
+                transformer_moe,
+                inplace=True,
+                old_symbol_map_new_symbol={"fsdp": "dp"},
+            )
+        else:
+            transformer_moe = ReplicateGraph.apply(
+                transformer_moe, inplace=True, old_symbol_map_new_symbol={"fsdp": 1}
+            )
+
+        transformer_moe = GradUpdater.apply(transformer_moe, inplace=True)
+        # In attention-only mode, keep ep in spatial_parallel_dims but it's set to 1
+        spatial_parallel_dims_moe = [dp, tp, spp, ep]
+
+        pipeline_tensor_map = _create_pipeline_tensor_map(
+            transformer_moe.tensors,
+            temporal_parallel_dims,
+            symbol_map_value,
+            num_stacks,
+        )
+
+        print("MoE attention-only model: Distributing")
+        distributed_tensor_graph_moe = GraphDistributer.apply(
+            transformer_moe,
+            symbol_map_value,
+            spatial_parallel_dims_moe,
+            temporal_parallel_dims,
+            pipeline_tensor_map,
+        )
+
+        if args.print_gpu_vram:
+            _print_gpu_vram(
+                distributed_tensor_graph_moe,
+                symbol_map_value,
+                mixed_precision=args.mixed_precision,
+                header="[MoE Attention-only] ",
+            )
+
+        print("MoE attention-only model: Converting Chakra")
+        comm_group_file = args.output_name.replace(".%d", "").replace(".et", ".json")
+        distributed_chakra_graph_moe = BundledConvertChakra.apply(
+            distributed_tensor_graph_moe,
+            symbol_map_value,
+            os.path.join(args.output_dir, comm_group_file),
+            mixed_precision=args.mixed_precision,
+        )
+
+        from symbolic_tensor_graph.chakra.backends.chakra_00_4_backend import (
+            Chakra004Backend as ReadoutBackend,
+        )
+
+        print("MoE attention-only model: reading out")
+        if os.environ.get("STAGE_MICROBATCH_OPTIMIZE", "0") != "0":
+            distributed_chakra_graph_moe = MicroBatchReplicatorPostProcess.apply(
+                distributed_chakra_graph_moe, args.batch // args.micro_batch
+            )
+        distributed_chakra_graph_moe.readout(generated_filename, backend=ReadoutBackend)
+        # Restore original MoE-related symbol values after processing is complete
+        symbol_map_value[ep] = original_ep
+        symbol_map_value[Experts] = original_experts
+        symbol_map_value[KExperts] = original_kexperts
+
+    elif args.model_type == "moe_ffn":
+        from models.stage1.moe_model import transformer as transformer_moe
+
+        assert args.tpsp
+        print("Assembling MoE FFN-only model")
+        transformer_moe = transformer_moe(num_stacks, symbol_map_value, regenerate=True, mode="ffn")
+        if os.environ.get("STAGE_MICROBATCH_OPTIMIZE", "0") == "0":
+            transformer_moe = MicroBatchReplicator.apply(
+                transformer_moe, symbol_map_value
+            )
+        else:
+            print("[Warning] MICROBATCH OPTIMIZE sometimes generate incorrect graphs, use with caution!")
+            assert False, "disable for now"
+        transformer_moe = ReplicateGraph.apply(
+            transformer_moe,
+            inplace=True,
+            old_symbol_map_new_symbol={"Batch": "MicroBatch"},
+        )
+
+        if args.weight_sharded:
+            transformer_moe = ReplicateGraph.apply(
+                transformer_moe,
+                inplace=True,
+                old_symbol_map_new_symbol={"fsdp": "dp"},
+            )
+        else:
+            transformer_moe = ReplicateGraph.apply(
+                transformer_moe, inplace=True, old_symbol_map_new_symbol={"fsdp": 1}
+            )
+
+        transformer_moe = GradUpdater.apply(transformer_moe, inplace=True)
+        spatial_parallel_dims_moe = [dp, tp, spp, ep]
+
+        pipeline_tensor_map = _create_pipeline_tensor_map(
+            transformer_moe.tensors,
+            temporal_parallel_dims,
+            symbol_map_value,
+            num_stacks,
+        )
+
+        print("MoE FFN-only model: Distributing")
+        distributed_tensor_graph_moe = GraphDistributer.apply(
+            transformer_moe,
+            symbol_map_value,
+            spatial_parallel_dims_moe,
+            temporal_parallel_dims,
+            pipeline_tensor_map,
+        )
+
+        if args.print_gpu_vram:
+            _print_gpu_vram(
+                distributed_tensor_graph_moe,
+                symbol_map_value,
+                mixed_precision=args.mixed_precision,
+                header="[MoE FFN-only] ",
+            )
+
+        print("MoE FFN-only model: Converting Chakra")
+        comm_group_file = args.output_name.replace(".%d", "").replace(".et", ".json")
+        distributed_chakra_graph_moe = BundledConvertChakra.apply(
+            distributed_tensor_graph_moe,
+            symbol_map_value,
+            os.path.join(args.output_dir, comm_group_file),
+            mixed_precision=args.mixed_precision,
+        )
+
+        from symbolic_tensor_graph.chakra.backends.chakra_00_4_backend import (
+            Chakra004Backend as ReadoutBackend,
+        )
+
+        print("MoE FFN-only model: reading out")
         if os.environ.get("STAGE_MICROBATCH_OPTIMIZE", "0") != "0":
             distributed_chakra_graph_moe = MicroBatchReplicatorPostProcess.apply(
                 distributed_chakra_graph_moe, args.batch // args.micro_batch

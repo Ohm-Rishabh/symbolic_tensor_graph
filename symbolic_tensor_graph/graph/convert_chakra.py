@@ -65,7 +65,17 @@ class ConvertChakra:
 
     @classmethod
     def _insert_comp(cls, tensor, symbol_map_value, nodes_this_tensor):
-        tensor_ops = Tensor.eval_expr(tensor.ops, symbol_map_value)
+        try:
+            tensor_ops = Tensor.eval_expr(tensor.ops, symbol_map_value)
+        except (TypeError, ValueError) as e:
+            # Debug: print which tensor and expression is causing the issue
+            print(f"Error evaluating tensor.ops for tensor {tensor.id}")
+            print(f"tensor.ops = {tensor.ops}")
+            print(f"tensor.ops type = {type(tensor.ops)}")
+            print(f"symbol_map_value keys = {list(symbol_map_value.keys())}")
+            if hasattr(tensor.ops, 'free_symbols'):
+                print(f"tensor.ops free_symbols = {tensor.ops.free_symbols}")
+            raise
         ## TODO: change implementation
         ## some tensors with identical op will translate no comp/comms, and leading issues when connecting tensor's nodes as the connection cannot skip the empty tensor.
         ## to avoid this, new insert zero size comp as place holder, and remove them later.
