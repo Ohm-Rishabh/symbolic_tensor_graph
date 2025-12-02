@@ -134,7 +134,8 @@ def transformer_decoder_block(
     symbol_map_value, layernorm_path=None, residual_path=None, mode="default"
 ):
     """
-    mode: "default" (both attention and FFN), "attention" (only attention), "ffn" (only FFN)
+    mode: "default" (both attention and FFN), "attention" (only attention), "ffn" (only FFN),
+          "forward_attention" (forward-only attention, no backward pass)
     """
     if layernorm_path is None:
         layernorm_path = "./sharding_spreadsheets/module3/tpsp_moe/layer_norm.csv"
@@ -144,8 +145,8 @@ def transformer_decoder_block(
     components = []
     links = dict()
 
-    # Build attention components if mode is "default" or "attention"
-    if mode in ["default", "attention"]:
+    # Build attention components if mode is "default", "attention", or "forward_attention"
+    if mode in ["default", "attention", "forward_attention"]:
         input_layernorm = ReplicateGraph.apply(
             TensorGraph.load_tensor_graph(layernorm_path),
             "input_norm.%s",
@@ -161,15 +162,28 @@ def transformer_decoder_block(
         )
         components.extend([input_layernorm, mha, mha_res])
 
-        # input_layernorm
+        # Forward path connections (all modes)
         links["input_norm.y"] = "mha.x"
-        # mha
         links["mha.o"] = "mha_res.x1"
         links["input_norm.x"] = "mha_res.x2"
-        links["mha_res.dx1"] = "mha.do"
+        
+        # Gradient connections (skip for forward_attention)
+        if mode != "forward_attention":
+            links["mha_res.dx1"] = "mha.do"
 
-    # For attention-only mode, add a pass-through ffn_res so transformer_decoders can connect blocks
-    if mode == "attention":
+    # For forward_attention mode, terminate after attention residual + post-attn norm (no FFN/residual add)
+    if mode == "forward_attention":
+        post_layernorm = ReplicateGraph.apply(
+            TensorGraph.load_tensor_graph(layernorm_path),
+            "post_attn_norm.%s",
+            old_symbol_map_new_symbol={"tp": "tp"},
+        )
+        components.append(post_layernorm)
+        links["mha_res.y"] = "post_attn_norm.x"
+        # No residual add beyond attention; next block consumes post_attn_norm.y
+
+    # For attention-only mode (with backward), add a pass-through ffn_res so transformer_decoders can connect blocks
+    elif mode == "attention":
         ffn_res = ReplicateGraph.apply(
             TensorGraph.load_tensor_graph(residual_path),
             "ffn_res.%s",
@@ -232,6 +246,12 @@ def transformer_decoder_block(
     decoder_block = ConnectGraph.apply(components, links)
 
     tensor_id_map_tensor = decoder_block.get_tensor_id_map_tensor()
+
+    # For forward_attention mode, skip all gradient handling
+    if mode == "forward_attention":
+        # No gradient connections needed - pure forward pass
+        # Skip FSDPWeightGradManager too
+        return decoder_block
 
     # Handle gradient connections based on mode
     if mode in ["default", "attention"]:
@@ -297,7 +317,8 @@ def transformer_decoder_block(
 
 def transformer(num_layers, symbol_map_value, embedding_path=None, regenerate=False, mode="default"):
     """
-    mode: "default" (both attention and FFN), "attention" (only attention), "ffn" (only FFN)
+    mode: "default" (both attention and FFN), "attention" (only attention), "ffn" (only FFN),
+          "forward_attention" (forward-only attention, no backward pass/gradients)
     """
     from . import CACHE_DIR
     import os
@@ -327,9 +348,20 @@ def transformer(num_layers, symbol_map_value, embedding_path=None, regenerate=Fa
     )
 
     decoder_template = transformer_decoder_block(symbol_map_value, mode=mode)
-    decoders = transformer_decoders(num_layers, decoder_template)
+    decoders = transformer_decoders(num_layers, decoder_template, mode=mode)
 
     links = dict()
+    
+    # For forward_attention mode, only connect forward path (no gradients)
+    if mode == "forward_attention":
+        links["in_emb.y"] = "transformer.0.input_norm.x"
+        # Connect final post-attention norm output to output embedding
+        links[f"transformer.{num_layers-1}.post_attn_norm.y"] = "out_emb.x"
+        transformer = ConnectGraph.apply([decoders, in_emb, out_emb], links)
+        # No loss, no backward - pure forward inference
+        transformer.save_tensor_graph(cache_filename)
+        return transformer
+    
     # Connect input embedding - all modes now have input_norm
     links["in_emb.y"] = "transformer.0.input_norm.x"
     links["transformer.0.input_norm.dx"] = "in_emb.dy"

@@ -124,15 +124,25 @@ def transformer_decoder_block(ffn_path=None, layernorm_path=None, residual_path=
     return decoder_block
 
 
-def transformer_decoders(num_layers, decoder_template):
+def transformer_decoders(num_layers, decoder_template, mode="default"):
+    forward_link_tensor = "ffn_res.y"
+    backward_link_tensor = "ffn_res.dy"
+    if mode == "forward_attention":
+        forward_link_tensor = "post_attn_norm.y"
+        backward_link_tensor = None
     links = dict()
     decoders = list()
     for i in range(num_layers):
         decoder = ReplicateGraph.apply(decoder_template, f"transformer.{i}.%s")
         decoders.append(decoder)
         if i > 0:
-            links[f"transformer.{i-1}.ffn_res.y"] = f"transformer.{i}.input_norm.x"
-            links[f"transformer.{i}.input_norm.dx"] = f"transformer.{i-1}.ffn_res.dy"
+            links[
+                f"transformer.{i-1}.{forward_link_tensor}"
+            ] = f"transformer.{i}.input_norm.x"
+            if backward_link_tensor is not None:
+                links[
+                    f"transformer.{i}.input_norm.dx"
+                ] = f"transformer.{i-1}.{backward_link_tensor}"
 
     decoders = ConnectGraph.apply(decoders, links)
     return decoders

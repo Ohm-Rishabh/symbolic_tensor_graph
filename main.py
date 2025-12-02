@@ -584,6 +584,86 @@ def main():
         symbol_map_value[Experts] = original_experts
         symbol_map_value[KExperts] = original_kexperts
 
+    elif args.model_type == "forward_attention":
+        from models.stage1.moe_model import transformer as transformer_moe
+
+        assert args.tpsp
+        print("=" * 60)
+        print("FORWARD-ONLY ATTENTION MODEL (No Backward Pass)")
+        print("=" * 60)
+        # Set MoE-related symbols to safe values
+        symbol_map_value[ep] = 1
+        symbol_map_value[Experts] = 1
+        symbol_map_value[KExperts] = 1
+        
+        transformer_moe = transformer_moe(num_stacks, symbol_map_value, regenerate=True, mode="forward_attention")
+        
+        # Skip MicroBatchReplicator for forward-only mode (no microbatch optimization needed)
+        transformer_moe = ReplicateGraph.apply(
+            transformer_moe,
+            inplace=True,
+            old_symbol_map_new_symbol={"Batch": "MicroBatch"},
+        )
+
+        if args.weight_sharded:
+            transformer_moe = ReplicateGraph.apply(
+                transformer_moe,
+                inplace=True,
+                old_symbol_map_new_symbol={"fsdp": "dp"},
+            )
+        else:
+            transformer_moe = ReplicateGraph.apply(
+                transformer_moe, inplace=True, old_symbol_map_new_symbol={"fsdp": 1}
+            )
+
+        # NO GradUpdater.apply() - this is forward-only!
+        print("Skipping GradUpdater (forward-only mode)")
+        
+        spatial_parallel_dims_moe = [dp, tp, spp, ep]
+
+        pipeline_tensor_map = _create_pipeline_tensor_map(
+            transformer_moe.tensors,
+            temporal_parallel_dims,
+            symbol_map_value,
+            num_stacks,
+        )
+
+        print("Forward-only attention: Distributing")
+        distributed_tensor_graph_moe = GraphDistributer.apply(
+            transformer_moe,
+            symbol_map_value,
+            spatial_parallel_dims_moe,
+            temporal_parallel_dims,
+            pipeline_tensor_map,
+        )
+
+        if args.print_gpu_vram:
+            _print_gpu_vram(
+                distributed_tensor_graph_moe,
+                symbol_map_value,
+                mixed_precision=args.mixed_precision,
+                header="[Forward Attention] ",
+            )
+
+        print("Forward-only attention: Converting Chakra")
+        comm_group_file = args.output_name.replace(".%d", "").replace(".et", ".json")
+        distributed_chakra_graph_moe = BundledConvertChakra.apply(
+            distributed_tensor_graph_moe,
+            symbol_map_value,
+            os.path.join(args.output_dir, comm_group_file),
+            mixed_precision=args.mixed_precision,
+        )
+
+        from symbolic_tensor_graph.chakra.backends.chakra_00_4_backend import (
+            Chakra004Backend as ReadoutBackend,
+        )
+
+        print("Forward-only attention: Reading out")
+        distributed_chakra_graph_moe.readout(generated_filename, backend=ReadoutBackend)
+        print("=" * 60)
+        print("FORWARD-ONLY GENERATION COMPLETE")
+        print("=" * 60)
+
     elif args.model_type == "moe_ffn":
         from models.stage1.moe_model import transformer as transformer_moe
 
