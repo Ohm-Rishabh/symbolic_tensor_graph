@@ -116,6 +116,53 @@ The schema version used determines compatibility with different tools and reposi
 - **v0.0.4**: Current latest chakra version (by Oct.6 2024).
 - **v0.0.1**: Supported for lagacy, not fully tested.
 
+---
+
+## Additional Model Types
+
+Beyond the standard `llama`, `gpt`, and `moe` models, the following specialized modes are available:
+
+### `moe_attention` — Attention-Only Mode
+
+Generates traces for **only the attention layers** of a MoE model, excluding the FFN/expert layers. Has both forward and backward.
+
+```bash
+python main.py --output_dir generated/attn/ \
+               --output_name attention_tp24 \
+               --model_type moe_attention \
+               --tp 24 \
+               --num_stacks 1 \
+               --batch 1 --seq 1024
+```
+
+### `moe_ffn` — FFN-Only Mode
+
+Generates traces for **only the FFN/expert layers**, excluding attention. Has both forward and backward.
+
+```bash
+python main.py --output_dir generated/ffn/ \
+               --output_name moe_ffn_8exp \
+               --model_type moe_ffn \
+               --tp 4 --ep 4 \
+               --experts 8 --kexperts 2 \
+               --num_stacks 1
+```
+
+### `forward_attention` — Forward-Only Mode
+
+Generates traces for **forward pass only** (no backward pass or gradient computation).
+
+```bash
+python main.py --output_dir generated/inference/ \
+               --output_name forward_only \
+               --model_type forward_attention \
+               --tp 8 \
+               --num_stacks 1 \
+               --batch 1 --seq 8192
+```
+
+---
+
 ## License
 
 MIT
